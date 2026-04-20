@@ -3,6 +3,9 @@ import cors from 'cors';
 import dotenv from 'dotenv';
 import mongoose from 'mongoose';
 import { analyzeIOC, fetchRecentFeeds } from './services/threatIntel.js';
+import { pivotInfrastructure } from './services/pivotService.js';
+import { batchGeolocate } from './services/geoService.js';
+import mitreService from './services/mitreService.js';
 import Scan from './models/Scan.js';
 import Rule from './models/Rule.js';
 
@@ -11,7 +14,9 @@ dotenv.config();
 const app = express();
 const PORT = process.env.PORT || 5000;
 
-app.use(cors());
+app.use(cors({
+  origin: process.env.FRONTEND_URL || '*'
+}));
 app.use(express.json());
 
 // MongoDB Connection
@@ -335,6 +340,154 @@ app.get('/api/sources', async (req, res) => {
     res.json(sources);
   } catch (error) {
     res.status(500).json({ error: 'Failed to fetch data sources' });
+  }
+});
+
+// ─────────────────────────────────────────────
+// Feature 1: Infrastructure Pivoting Engine
+// ─────────────────────────────────────────────
+app.get('/api/pivot', async (req, res) => {
+  try {
+    const { ioc, type } = req.query;
+    if (!ioc) return res.status(400).json({ error: 'ioc parameter is required' });
+
+    const iocType = type || (ioc.match(/^(\d{1,3}\.){3}\d{1,3}$/) ? 'ip' : 'domain');
+    const result = await pivotInfrastructure(ioc, iocType);
+    res.json(result);
+  } catch (error) {
+    console.error('Pivot error:', error);
+    res.status(500).json({ error: error.message || 'Pivot failed' });
+  }
+});
+
+// ─────────────────────────────────────────────
+// Feature 2: MITRE ATT&CK Heatmap (Navigator Export)
+// ─────────────────────────────────────────────
+app.get('/api/mitre/heatmap', async (req, res) => {
+  try {
+    // Build technique frequency map from all stored scans
+    const techniqueMap = {};
+    if (mongoose.connection.readyState === 1) {
+      const scans = await Scan.find({}, { techniques: 1 });
+      scans.forEach(scan => {
+        scan.techniques.forEach(tech => {
+          if (!tech.id) return;
+          const id = tech.id.toUpperCase();
+          if (!techniqueMap[id]) {
+            techniqueMap[id] = { id, name: tech.name, count: 0, tactic: tech.tactic || 'unknown' };
+          }
+          techniqueMap[id].count += 1;
+        });
+      });
+    }
+
+    const techniques = Object.values(techniqueMap);
+    const maxCount = Math.max(...techniques.map(t => t.count), 1);
+
+    // Generate ATT&CK Navigator layer.json format
+    const layer = {
+      name: 'Threat Intelligence Platform — Live Detections',
+      versions: { attack: '14', navigator: '4.9.1', layer: '4.5' },
+      domain: 'enterprise-attack',
+      description: `Auto-generated from ${techniques.length} observed techniques across all analyzed IOCs.`,
+      filters: { platforms: ['Windows', 'Linux', 'macOS'] },
+      sorting: 3,
+      layout: { layout: 'side', aggregateFunction: 'max', showID: true, showName: true, showAggregateScores: true },
+      hideDisabled: false,
+      techniques: techniques.map(t => ({
+        techniqueID: t.id,
+        tactic: t.tactic?.toLowerCase().replace(/\s+/g, '-') || undefined,
+        score: Math.ceil((t.count / maxCount) * 100),  // normalized 0–100
+        color: '',
+        comment: `Detected ${t.count} time(s) across analyzed IOCs`,
+        enabled: true,
+        metadata: [],
+        showSubtechniques: false
+      })),
+      gradient: {
+        colors: ['#fffcd4', '#f4a582', '#d73027'],
+        minValue: 0,
+        maxValue: 100
+      },
+      legendItems: [],
+      metadata: [{ name: 'generated', value: new Date().toISOString() }]
+    };
+
+    res.json({ layer, stats: { total_techniques: techniques.length, max_detections: maxCount, techniques } });
+  } catch (error) {
+    console.error('Heatmap error:', error);
+    res.status(500).json({ error: error.message || 'Heatmap generation failed' });
+  }
+});
+
+// ─────────────────────────────────────────────
+// Feature 3: IP Geolocation Map
+// ─────────────────────────────────────────────
+app.get('/api/geo', async (req, res) => {
+  try {
+    if (mongoose.connection.readyState !== 1) {
+      return res.json({ markers: [], stats: { total: 0, countries: 0, critical: 0, high: 0 } });
+    }
+
+    // Fetch all IP-type scans from MongoDB
+    const ipScans = await Scan.find({ type: 'ip' }, {
+      ioc: 1, risk: 1, pattern: 1, summary: 1, timestamp: 1, techniques: 1
+    }).sort({ timestamp: -1 }).limit(200);
+
+    if (ipScans.length === 0) {
+      return res.json({ markers: [], stats: { total: 0, countries: 0, critical: 0, high: 0 } });
+    }
+
+    const uniqueIPs = [...new Set(ipScans.map(s => s.ioc))];
+
+    // Batch geolocate all unique IPs
+    const geoResults = await batchGeolocate(uniqueIPs);
+    const geoMap = new Map(geoResults.map(g => [g.ip, g]));
+
+    // Merge scan data with geolocation
+    const markers = [];
+    const processedIPs = new Set();
+
+    for (const scan of ipScans) {
+      if (processedIPs.has(scan.ioc)) continue;
+      processedIPs.add(scan.ioc);
+
+      const geo = geoMap.get(scan.ioc);
+      if (!geo) continue;
+
+      markers.push({
+        ip: scan.ioc,
+        lat: geo.lat,
+        lon: geo.lon,
+        country: geo.country,
+        countryCode: geo.countryCode,
+        city: geo.city,
+        region: geo.region,
+        isp: geo.isp,
+        org: geo.org,
+        as: geo.as,
+        risk: scan.risk,
+        pattern: scan.pattern,
+        summary: scan.summary,
+        timestamp: scan.timestamp,
+        techniqueCount: scan.techniques?.length || 0
+      });
+    }
+
+    const countries = new Set(markers.map(m => m.country));
+
+    res.json({
+      markers,
+      stats: {
+        total: markers.length,
+        countries: countries.size,
+        critical: markers.filter(m => m.risk === 'critical').length,
+        high: markers.filter(m => m.risk === 'high').length
+      }
+    });
+  } catch (error) {
+    console.error('Geo error:', error);
+    res.status(500).json({ error: error.message || 'Geolocation lookup failed' });
   }
 });
 

@@ -1,7 +1,6 @@
 import axios from 'axios';
 import { analyzeWithAI } from './aiService.js';
 import { generateRules } from './ruleGenerator.js';
-import { extractCVEsFromRawData, enrichCVEs } from './cveService.js';
 
 // Helper to check if a string is an IP address
 const isIP = (str) => {
@@ -167,8 +166,8 @@ export const analyzeIOC = async (ioc) => {
         results.ioc.risk_level = risk;
         results.ioc.confidence = Math.min(100, Math.round((detected / total) * 100 * 1.5)) || 0;
 
-        results.ioc.explainability = `Indicator shows high-risk markers across multiple threat intelligence sources (Confidence: ${results.ioc.confidence}%). `;
-        if (data.reputation) results.ioc.explainability += `Community threat reputation score: ${data.reputation}. `;
+        results.ioc.explainability = `VirusTotal analysis statistics: ${detected}/${total} engines detected this as malicious. `;
+        if (data.reputation) results.ioc.explainability += `Community reputation score is ${data.reputation}. `;
 
         results.evidence.push({
             source_name: 'VirusTotal',
@@ -192,7 +191,7 @@ export const analyzeIOC = async (ioc) => {
 
                 if (res.category === 'malicious' && results.behaviors.length < 5) {
                     results.behaviors.push({
-                        description: `Threat detection: ${res.result}`,
+                        description: `${vendor} detected: ${res.result}`,
                         timestamp: new Date().toISOString()
                     });
                 }
@@ -265,7 +264,7 @@ export const analyzeIOC = async (ioc) => {
             if (data.abuseConfidenceScore > 80) results.ioc.risk_level = 'critical';
         }
 
-        results.ioc.explainability += `Significant behavioral reports from IP reputation databases. `;
+        results.ioc.explainability += `AbuseIPDB Confidence Score: ${data.abuseConfidenceScore}%. Total Reports: ${data.totalReports}. `;
         results.evidence.push({
             source_name: 'AbuseIPDB',
             evidence_type: 'reputation',
@@ -283,7 +282,7 @@ export const analyzeIOC = async (ioc) => {
         results.ioc.risk_level = 'critical';
         results.ioc.confidence = 100;
 
-        results.ioc.explainability += `Confirmed malicious activity in verified threat databases. `;
+        results.ioc.explainability += `Found in ThreatFox database (${hit.malware_printable}). `;
         results.evidence.push({
             source_name: 'ThreatFox',
             evidence_type: 'threat_intel',
@@ -309,7 +308,7 @@ export const analyzeIOC = async (ioc) => {
         results.details.sources.otx = data;
 
         if (data.pulse_info && data.pulse_info.count > 0) {
-            results.ioc.explainability += `Indicator associated with multiple known threat pulses. `;
+            results.ioc.explainability += `Associated with ${data.pulse_info.count} OTX pulses. `;
             if (results.ioc.risk_level === 'unknown' || results.ioc.risk_level === 'low') {
                 results.ioc.risk_level = 'medium';
             }
@@ -408,25 +407,6 @@ export const analyzeIOC = async (ioc) => {
             sigma_rules_matched: vtData.sigma_analysis_results?.length || 0,
             ids_alerts: vtData.crowdsourced_ids_results?.length || 0,
         };
-    }
-
-    // --- CVE Extraction (Verified Sources Only — No AI) ---
-    // Extract CVE IDs from raw VT/ThreatFox/OTX data BEFORE vtData is lost
-    const tfRaw = results.details.sources.threatfox || null;
-    const otxRaw = results.details.sources.otx || null;
-    const { cveIds, provenance } = extractCVEsFromRawData(vtData, tfRaw, otxRaw);
-
-    if (cveIds.length > 0) {
-        console.log(`🔍 Found ${cveIds.length} CVE(s) from verified sources: ${cveIds.join(', ')}`);
-        try {
-            results.cves = await enrichCVEs(cveIds, provenance);
-            console.log(`✅ Enriched ${results.cves.length} CVE(s) via NVD`);
-        } catch (cveErr) {
-            console.error('CVE enrichment failed:', cveErr.message);
-            results.cves = [];
-        }
-    } else {
-        results.cves = [];
     }
 
     // --- AI-Powered Sophistication & Hybrid Mapping ---

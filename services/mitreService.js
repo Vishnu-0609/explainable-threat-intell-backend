@@ -93,6 +93,7 @@ export const validateTechnique = (tech) => {
             name: validTech.name,
             tactic: validTech.tactic,
             description: validTech.description?.split('\n')[0] || tech.description, // Keep it concise
+            full_description: validTech.description,
             url: validTech.url,
             validated: true
         };

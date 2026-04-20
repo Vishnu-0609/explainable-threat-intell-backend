@@ -24,6 +24,31 @@ export const generateRules = (ioc, data, techniques = []) => {
         });
     }
 
+    // 3. Generate Actionable Mitigation Rules (from AI Countermeasures)
+    // Only include countermeasures that have a REAL executable command - not generic advice text
+    const COMMAND_INDICATORS = [
+        'netsh', 'iptables', 'firewall', 'reg ', 'reg delete', 'reg add',
+        'taskkill', 'Get-Process', 'Stop-Process', 'Add-Content', 'Set-Content',
+        'echo ', 'hosts', 'route add', 'route delete', 'ipblock', 'wmic',
+        'Remove-Item', 'sysctl', 'ufw', 'pfctl', 'sc ', 'sc stop', 'sc delete',
+        'net stop', 'net user', 'auditpol', 'secedit', 'nft ', 'ipset'
+    ];
+    const isRealCommand = (cmd) => cmd && COMMAND_INDICATORS.some(kw => cmd.toLowerCase().includes(kw.toLowerCase()));
+
+    if (data.countermeasures && data.countermeasures.length > 0) {
+        data.countermeasures.forEach(cm => {
+            if (isRealCommand(cm.command)) {
+                rules.push({
+                    type: 'Mitigation',
+                    title: `Security Action: ${cm.name}`,
+                    format: 'cmd',
+                    content: cm.command,
+                    detail: cm.detail
+                });
+            }
+        });
+    }
+
     return rules;
 };
 
